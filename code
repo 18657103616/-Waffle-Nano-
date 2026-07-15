@@ -1,0 +1,490 @@
+from machine import SPI, Pin
+import st7789, utime, gc, network, usocket as socket
+gc.collect()
+
+BS = 4
+
+# ========== WiFi 键盘(替代TTP229) ==========
+SSID = 'hid21976449的P40'
+PASSWORD = '54088bls'
+
+KEY_MAP = {
+    b'1': 1,
+    b'2': 2,
+    b'3': 3,
+    b'4': 4,
+}
+
+print("WiFi...")
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+wlan.connect(SSID, PASSWORD, security=network.AUTH_PSK)
+utime.sleep(5)
+gc.collect()
+
+PORT = 5000
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.bind(('0.0.0.0', PORT))
+srv.listen(1)
+srv.settimeout(1)
+gc.collect()
+
+conn = None
+
+def get_key():
+    global conn
+    if conn is None:
+        try:
+            conn, _ = srv.accept()
+            conn.setblocking(False)
+            print("PC connected")
+        except:
+            return None
+    try:
+        data = conn.recv(16)
+        if data:
+            kb = data.strip()[:1]
+            return KEY_MAP.get(kb, None)
+    except:
+        pass
+    return None
+
+# ========== 显示 ==========
+spi = SPI(0, baudrate=40000000, polarity=1, phase=0, bits=8, endia=0,
+          sck=Pin(6), mosi=Pin(8))
+disp = st7789.ST7789(spi, 240, 240,
+                  reset=Pin(11, func=Pin.GPIO, dir=Pin.OUT),
+                  dc=Pin(7, func=Pin.GPIO, dir=Pin.OUT))
+disp.init()
+gc.collect()
+
+# 颜色
+C_B = st7789.color565(0,0,0)
+C_W = st7789.color565(255,255,255)
+C_O = st7789.color565(255,150,60)
+C_C = st7789.color565(250,240,220)
+C_P = st7789.color565(255,160,180)
+C_BR = st7789.color565(160,90,50)
+C_SK = st7789.color565(135,206,235)
+C_G = st7789.color565(50,180,50)
+C_GD = st7789.color565(30,140,30)
+C_Y = st7789.color565(255,255,0)
+C_SH = st7789.color565(60,60,60)
+C_F = st7789.color565(255,180,50)
+C_HUN = st7789.color565(255,80,80)
+C_SLP = st7789.color565(100,180,255)
+C_HAP = st7789.color565(50,255,100)
+
+# 颜色方案
+SCHEMES = [
+    (C_O, C_C, '柴犬'),
+    (st7789.color565(100,100,100), st7789.color565(180,180,180), '灰狗'),
+    (st7789.color565(139,69,19), st7789.color565(210,180,140), '棕狗'),
+    (st7789.color565(255,215,0), st7789.color565(255,250,205), '金毛'),
+]
+c_color = 0
+
+def get_main(): return SCHEMES[c_color][0]
+def get_face(): return SCHEMES[c_color][1]
+
+# 状态
+affection, saturation = 50, 60
+MAX_A, MAX_S = 100, 100
+A_DECAY, S_DECAY = 2, 10
+PET_LIMIT = 10
+pet_today, last_pet_day, last_decay = 0, -1, 0
+menu_on, flash_on = False, False
+flash_val, flash_t = 0, 0
+sleeping = False
+SCREEN_LIMIT = 5 * 3600
+screen_start = 0
+
+# 尾巴摇摆
+tail_wagging = False
+wag_count = 0
+wag_frame = 0
+wag_timer = 0
+WAG_MAX = 3
+WAG_SPEED = 8
+WAG_OFFSET = 1
+
+# 眨眼
+blinking = False
+blink_frame = 0
+blink_timer = 0
+BLINK_INTERVAL = 100
+BLINK_DURATION = 3
+
+FOODS = [25, 20, 15, 18]
+
+# ========== 像素数据(原始柴犬) ==========
+head = [
+    "000000000000000000","000000000000000000","000000000000000000",
+    "000011111111110000","000111111111111000","001111111111111100",
+    "001112222222221100","011122222222222110","011222222222222210",
+    "111222222222222211","111222222222222211","111222222222222211",
+    "011222222222222210","011122222222222110","001112222222221100",
+    "000111111111111000","000011111111110000","000000000000000000",
+]
+body = [
+    "000011111111000000","001111111111110000","011111111111111000",
+    "011122222222211100","011222222222221100","011222222222221100",
+    "011122222222211100","001112222222211000","000111111111110000",
+    "000011111111100000","000001111111000000","000000111110000000",
+    "000000011100000000","000000001000000000",
+]
+fleg = ["01110","11111","12221","12221","11111","01110"]
+bleg = ["011110","111111","122221","122221","111111"]
+tail_base = [
+    "00000000","00000110","00001111","00011121","00111221","00112210","00112100","00011000",
+]
+
+# ========== 绘制函数 ==========
+def b(d, x, y, c, s):
+    x, y, s = int(x), int(y), int(s)
+    for dy in range(s):
+        for dx in range(s):
+            px, py = x+dx, y+dy
+            if 0 <= px < 240 and 0 <= py < 240:
+                d.pixel(px, py, c)
+
+def scene(d):
+    d.fill(C_SK)
+    d.fill_rect(175, 35, 20, 20, C_Y)
+    d.fill_rect(0, 150, 240, 90, C_G)
+    for y in range(150, 240, 4):
+        for x in range(0, 240, 4):
+            d.pixel(x, y, C_GD)
+
+def draw_tail(d, cx, cy, sc, wag_dy=0):
+    s, p = sc, BS * sc
+    mc2, fc2 = get_main(), get_face()
+    tx = cx + 7 * p
+    ty = cy + 6 * p + wag_dy * p
+    for r, row in enumerate(tail_base):
+        for c, ch in enumerate(row):
+            if ch == '1':
+                b(d, tx + (c - 3) * p, ty + (r - 3) * p, mc2, p)
+            elif ch == '2':
+                b(d, tx + (c - 3) * p, ty + (r - 3) * p, fc2, p)
+
+def draw_eyes(d, cx, cy, sc, closed=False):
+    s, p = sc, BS * sc
+    hy = cy - 2 * p
+    if closed:
+        b(d, cx - 4*p, hy - 1*p, C_B, p)
+        b(d, cx - 3*p, hy - 1*p, C_B, p)
+        b(d, cx + 3*p, hy - 1*p, C_B, p)
+        b(d, cx + 4*p, hy - 1*p, C_B, p)
+    else:
+        b(d, cx - 3*p, hy - 1*p, C_W, p)
+        b(d, cx + 3*p, hy - 1*p, C_W, p)
+        b(d, cx - 4*p, hy, C_B, p)
+        b(d, cx - 3*p, hy, C_B, p)
+        b(d, cx + 3*p, hy, C_B, p)
+        b(d, cx + 4*p, hy, C_B, p)
+
+def draw_pet(d, cx, cy, sc):
+    s, p = sc, BS * sc
+    mc2, fc2 = get_main(), get_face()
+    for dx in range(-12, 13):
+        b(d, cx+dx*p, cy+22*p, C_SH, p)
+    if tail_wagging:
+        if wag_frame == 0:
+            draw_tail(d, cx, cy, sc, -WAG_OFFSET)
+        else:
+            draw_tail(d, cx, cy, sc, WAG_OFFSET)
+    else:
+        draw_tail(d, cx, cy, sc, 0)
+    for bx, by in [(cx-6*p, cy+12*p), (cx+6*p, cy+12*p)]:
+        for r, row in enumerate(bleg):
+            for c, ch in enumerate(row):
+                if ch == '1': b(d, bx+(c-3)*p, by+(r-2)*p, mc2, p)
+                elif ch == '2': b(d, bx+(c-3)*p, by+(r-2)*p, fc2, p)
+    bx, by = cx, cy+10*p
+    for r, row in enumerate(body):
+        for c, ch in enumerate(row):
+            if ch == '1': b(d, bx+(c-9)*p, by+(r-7)*p, mc2, p)
+            elif ch == '2': b(d, bx+(c-9)*p, by+(r-7)*p, fc2, p)
+    for fx, fy in [(cx-4*p, cy+13*p), (cx+4*p, cy+13*p)]:
+        for r, row in enumerate(fleg):
+            for c, ch in enumerate(row):
+                if ch == '1': b(d, fx+(c-2)*p, fy+(r-3)*p, mc2, p)
+                elif ch == '2': b(d, fx+(c-2)*p, fy+(r-3)*p, fc2, p)
+    hy = cy - 2*p
+    for r, row in enumerate(head):
+        for c, ch in enumerate(row):
+            if ch == '1': b(d, cx+(c-9)*p, hy+(r-9)*p, mc2, p)
+            elif ch == '2': b(d, cx+(c-9)*p, hy+(r-9)*p, fc2, p)
+    for ex in [cx-6*p, cx-5*p, cx+4*p, cx+5*p]:
+        for ey in [hy-3*p, hy-2*p]:
+            b(d, ex, ey, mc2, p)
+    draw_eyes(d, cx, cy, sc, closed=blinking and blink_frame == 1)
+    b(d, cx-1*p, hy+2*p, C_BR, p); b(d, cx, hy+2*p, C_BR, p)
+    b(d, cx+1*p, hy+2*p, C_BR, p); b(d, cx, hy+3*p, C_BR, p)
+    for dx in [-2,-1,0,1,2]:
+        b(d, cx+dx*p, hy+4*p, C_B, p)
+    b(d, cx-5*p, hy+1*p, C_P, p); b(d, cx-4*p, hy+1*p, C_P, p)
+    b(d, cx+4*p, hy+1*p, C_P, p); b(d, cx+5*p, hy+1*p, C_P, p)
+
+# ========== 状态栏(用内置draw_string) ==========
+def get_status():
+    if utime.time() - screen_start >= SCREEN_LIMIT:
+        return "SLEEPY", C_SLP
+    if saturation < 30:
+        return "HUNGRY", C_HUN
+    return "HAPPY", C_HAP
+
+def draw_status(d):
+    txt, c = get_status()
+    sc = 2
+    tw = len(txt) * 8 * sc
+    d.draw_string((240-tw)//2, 10, txt, color=c, bg=C_B, size=sc)
+
+def draw_love(d, v):
+    sc = 2
+    txt = "LOVE " + str(v) + "/" + str(MAX_A)
+    tw = len(txt) * 8 * sc
+    d.draw_string((240-tw)//2, 188, txt, color=C_W, bg=C_B, size=sc)
+
+def draw_food_txt(d, v):
+    sc = 2
+    txt = "FOOD " + str(v) + "/" + str(MAX_S)
+    tw = len(txt) * 8 * sc
+    d.draw_string((240-tw)//2, 215, txt, color=C_F, bg=C_B, size=sc)
+
+def draw_flash(d, v):
+    sc = 2
+    txt = "FOOD +" + str(v)
+    tw = len(txt) * 8 * sc
+    x = (240 - tw) // 2
+    d.fill_rect(x-4, 60-4, tw+8, 10*sc+8, C_B)
+    d.draw_string(x, 60, txt, color=C_F, bg=C_B, size=sc)
+
+def draw_menu(d):
+    d.fill(C_B)
+    d.draw_string(65, 15, "FOOD MENU", color=C_W, bg=C_B, size=2)
+    for i in range(4):
+        y = 55 + i * 40
+        txt = str(i+1) + ": +" + str(FOODS[i])
+        d.draw_string(80, y, txt, color=C_Y, bg=C_B, size=2)
+
+def draw_sleep(d):
+    d.fill(C_B)
+    d.draw_string(70, 100, "SLEEPING", color=C_W, bg=C_B, size=2)
+    d.draw_string(50, 130, "Zzz...", color=C_SLP, bg=C_B, size=2)
+
+# ========== 刷新 ==========
+def refresh():
+    scene(disp)
+    draw_pet(disp, 120, 100, 1.0)
+    draw_status(disp)
+    if flash_on: draw_flash(disp, flash_val)
+    draw_love(disp, affection)
+    draw_food_txt(disp, saturation)
+
+def refresh_menu():
+    draw_menu(disp)
+
+def refresh_bars():
+    draw_status(disp)
+    draw_love(disp, affection)
+    draw_food_txt(disp, saturation)
+
+def check_decay():
+    global affection, saturation, last_decay
+    t = utime.time()
+    elapsed = t - last_decay
+    if elapsed >= 3600:
+        h = elapsed // 3600
+        affection = max(0, affection - A_DECAY * h)
+        saturation = max(0, saturation - S_DECAY * h)
+        last_decay = t - (elapsed % 3600)
+        return True
+    return False
+
+def enter_sleep():
+    global sleeping, tail_wagging, blinking
+    sleeping = True
+    tail_wagging = False
+    blinking = False
+    print("sleep")
+    draw_sleep(disp)
+    try: disp.off()
+    except: pass
+    spi.deinit()
+
+def wake_up():
+    global sleeping, screen_start
+    sleeping = False
+    screen_start = utime.time()
+    print("wake")
+    spi.init(baudrate=40000000, polarity=1, phase=0, bits=8, endia=0,
+             sck=Pin(6), mosi=Pin(8))
+    disp.init()
+    try: disp.on()
+    except: pass
+    refresh()
+
+def main():
+    global affection, saturation, pet_today, last_pet_day, last_decay
+    global menu_on, flash_on, flash_val, flash_t, sleeping
+    global c_color, screen_start
+    global tail_wagging, wag_count, wag_frame, wag_timer
+    global blinking, blink_frame, blink_timer
+
+    last_decay = utime.time()
+    screen_start = utime.time()
+
+    print("ready")
+    refresh()
+    print("done")
+
+    tick = 0
+    while True:
+        gc.collect()
+        key = get_key()
+        if key:
+            print("k:", key)
+            if sleeping:
+                wake_up()
+                continue
+
+            if tail_wagging and key != 1:
+                tail_wagging = False
+                wag_count, wag_frame, wag_timer = 0, 0, 0
+                refresh()
+
+            if key == 1:
+                if menu_on:
+                    fv = FOODS[0]
+                    old = saturation
+                    saturation = min(saturation + fv, MAX_S)
+                    print("eat 1 +", saturation-old)
+                    menu_on = False
+                    flash_on, flash_val, flash_t = True, fv, 0
+                    refresh()
+                else:
+                    tail_wagging = True
+                    wag_count, wag_frame, wag_timer = 0, 0, 0
+                    print("wag start")
+                    current_day = utime.localtime()[2]
+                    if current_day != last_pet_day:
+                        pet_today, last_pet_day = 0, current_day
+                    rem = PET_LIMIT - pet_today
+                    if rem > 0:
+                        add = min(5, rem)
+                        affection = min(affection + add, MAX_A)
+                        pet_today += add
+                        print("pet", affection, pet_today)
+                    else:
+                        print("no pet")
+                    refresh()
+
+            elif key == 2:
+                if menu_on:
+                    fv = FOODS[1]
+                    old = saturation
+                    saturation = min(saturation + fv, MAX_S)
+                    print("eat 2 +", saturation-old)
+                    menu_on = False
+                    flash_on, flash_val, flash_t = True, fv, 0
+                    refresh()
+                else:
+                    menu_on = True
+                    print("menu")
+                    refresh_menu()
+
+            elif key == 3:
+                if menu_on:
+                    fv = FOODS[2]
+                    old = saturation
+                    saturation = min(saturation + fv, MAX_S)
+                    print("eat 3 +", saturation-old)
+                    menu_on = False
+                    flash_on, flash_val, flash_t = True, fv, 0
+                    refresh()
+                else:
+                    c_color = (c_color + 1) % len(SCHEMES)
+                    print("color", SCHEMES[c_color][2])
+                    refresh()
+
+            elif key == 4:
+                if menu_on:
+                    fv = FOODS[3]
+                    old = saturation
+                    saturation = min(saturation + fv, MAX_S)
+                    print("eat 4 +", saturation-old)
+                    menu_on = False
+                    flash_on, flash_val, flash_t = True, fv, 0
+                    refresh()
+                else:
+                    enter_sleep()
+
+        if sleeping:
+            tick += 1
+            if tick >= 200:
+                tick = 0
+                if check_decay():
+                    print("sleep decay", affection, saturation)
+            utime.sleep_ms(50)
+            continue
+
+        if tail_wagging:
+            wag_timer += 1
+            if wag_timer >= WAG_SPEED:
+                wag_timer = 0
+                wag_frame = 1 - wag_frame
+                if wag_frame == 0:
+                    wag_count += 1
+                    print("wag", wag_count)
+                if wag_count >= WAG_MAX:
+                    tail_wagging = False
+                    wag_count, wag_frame, wag_timer = 0, 0, 0
+                    print("wag end")
+                if not menu_on and not flash_on:
+                    if tail_wagging:
+                        if wag_frame == 0:
+                            draw_tail(disp, 120, 100, 1.0, -WAG_OFFSET)
+                        else:
+                            draw_tail(disp, 120, 100, 1.0, WAG_OFFSET)
+                    else:
+                        refresh()
+
+        blink_timer += 1
+        if not blinking:
+            if blink_timer >= BLINK_INTERVAL:
+                blink_timer = 0
+                blinking = True
+                blink_frame = 1
+                print("blink")
+                if not menu_on and not flash_on and not tail_wagging:
+                    draw_eyes(disp, 120, 100, 1.0, closed=True)
+        else:
+            if blink_timer >= BLINK_DURATION:
+                blink_timer = 0
+                blinking = False
+                blink_frame = 0
+                print("blink end")
+                if not menu_on and not flash_on and not tail_wagging:
+                    draw_eyes(disp, 120, 100, 1.0, closed=False)
+
+        if flash_on:
+            flash_t += 1
+            if flash_t == 1:
+                refresh()
+            elif flash_t >= 2:
+                flash_on, flash_t = False, 0
+                refresh()
+
+        tick += 1
+        if tick >= 200:
+            tick = 0
+            if not menu_on and not flash_on and not tail_wagging and not blinking and check_decay():
+                print("decay", affection, saturation)
+                refresh_bars()
+
+        utime.sleep_ms(50)
+
+if __name__ == "__main__":
+    main()
